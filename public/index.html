@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Mini Video Streaming Platform</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1a1a2e; }
+  h1 { font-size: 22px; }
+  .card { border: 1px solid #ddd; border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+  progress { width: 100%; height: 10px; }
+  #status { font-size: 14px; color: #555; margin-top: 8px; white-space: pre-line; }
+  video { width: 100%; border-radius: 8px; background: #000; margin-top: 12px; }
+  button { background: #1a1a2e; color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; }
+  button:disabled { background: #999; cursor: not-allowed; }
+</style>
+</head>
+<body>
+  <h1>Mini Video Streaming Platform</h1>
+
+  <div class="card">
+    <input type="file" id="fileInput" accept="video/*" />
+    <button id="uploadBtn">Upload &amp; Transcode</button>
+    <progress id="progressBar" value="0" max="1"></progress>
+    <div id="status">Pick a video file to begin.</div>
+  </div>
+
+  <div class="card">
+    <video id="player" controls></video>
+  </div>
+
+<script>
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk
+
+const fileInput = document.getElementById('fileInput');
+const uploadBtn = document.getElementById('uploadBtn');
+const progressBar = document.getElementById('progressBar');
+const statusEl = document.getElementById('status');
+
+function setStatus(text) { statusEl.textContent = text; }
+
+async function postJSON(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${url} failed: ${res.status}`);
+  return res.json();
+}
+
+// Retries a chunk upload a few times before giving up, since flaky
+// networks are the whole reason resumable upload exists.
+async function uploadChunkWithRetry(uploadId, chunkIndex, chunk, attempts = 3) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const form = new FormData();
+      form.append('uploadId', uploadId);
+      form.append('chunkIndex', chunkIndex);
+      form.append('chunk', chunk);
+      const res = await fetch('/api/upload/chunk', { method: 'POST', body: form });
+      if (!res.ok) throw new Error(`chunk ${chunkIndex} failed: ${res.status}`);
+      return;
+    } catch (err) {
+      if (attempt === attempts) throw err;
+      await new Promise((r) => setTimeout(r, 500 * attempt));
+    }
+  }
+}
+
+async function uploadFile(file) {
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  const storageKey = `upload:${file.name}:${file.size}`;
+  let uploadId = localStorage.getItem(storageKey);
+  let receivedChunks = new Set();
+
+  // Resume support: if we have an uploadId from a previous attempt,
+  // ask the server which chunks it already has and skip those.
+  if (uploadId) {
+    const res = await fetch(`/api/upload/status/${uploadId}`);
+    if (res.ok) {
+      const data = await res.json();
+      receivedChunks = new Set(data.receivedChunks);
+    } else {
+      uploadId = null;
+    }
+  }
+
+  if (!uploadId) {
+    ({ uploadId } = await postJSON('/api/upload/init', {
+      filename: file.name,
+      fileSize: file.size,
+      totalChunks,
+    }));
+    localStorage.setItem(storageKey, uploadId);
+  }
+
+  for (let i = 0; i < totalChunks; i++) {
+    if (receivedChunks.has(i)) {
+      progressBar.value = (i + 1) / totalChunks;
+      continue;
+    }
+    const start = i * CHUNK_SIZE;
+    const chunk = file.slice(start, start + CHUNK_SIZE);
+    await uploadChunkWithRetry(uploadId, i, chunk);
+    progressBar.value = (i + 1) / totalChunks;
+    setStatus(`Uploading... ${i + 1}/${totalChunks} chunks`);
+  }
+
+  const { videoId } = await postJSON('/api/upload/complete', { uploadId });
+  localStorage.removeItem(storageKey);
+  return videoId;
+}
+
+async function waitUntilReady(videoId) {
+  while (true) {
+    const res = await fetch(`/api/videos/${videoId}/status`);
+    const job = await res.json();
+    const renditionLines = Object.entries(job.renditions)
+      .map(([name, state]) => `  ${name}: ${state}`)
+      .join('\n');
+    setStatus(`Transcoding (${job.status})\n${renditionLines}`);
+    if (job.status === 'ready' || job.status === 'error') return job;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+
+function playVideo(videoId) {
+  const video = document.getElementById('player');
+  const src = `/videos/${videoId}/master.m3u8`;
+  if (Hls.isSupported()) {
+    const hls = new Hls();
+    hls.loadSource(src);
+    hls.attachMedia(video);
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = src; // Safari has native HLS support
+  } else {
+    setStatus('HLS not supported in this browser; falling back to raw file.');
+    video.src = `/raw/${videoId}`;
+  }
+}
+
+uploadBtn.addEventListener('click', async () => {
+  const file = fileInput.files[0];
+  if (!file) return setStatus('Choose a file first.');
+  uploadBtn.disabled = true;
+  try {
+    setStatus('Starting upload...');
+    const videoId = await uploadFile(file);
+    setStatus('Upload complete. Waiting for transcode...');
+    const job = await waitUntilReady(videoId);
+    if (job.status === 'ready') {
+      setStatus('Ready! Adaptive bitrate stream is live.');
+      playVideo(videoId);
+    } else {
+      setStatus(`Transcode failed: ${job.error}`);
+    }
+  } catch (err) {
+    setStatus(`Error: ${err.message}`);
+  } finally {
+    uploadBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

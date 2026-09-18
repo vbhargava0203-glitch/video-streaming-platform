@@ -1,0 +1,16 @@
+{
+  "name": "video-streaming-platform",
+  "version": "1.0.0",
+  "description": "Mini video streaming platform: chunked resumable uploads, FFmpeg transcoding pipeline, adaptive bitrate HLS streaming, and range-request handling.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "fluent-ffmpeg": "^2.1.3",
+    "multer": "^2.0.0",
+    "uuid": "^9.0.1"
+  }
+}
